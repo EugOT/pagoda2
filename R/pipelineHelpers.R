@@ -6,27 +6,47 @@
 #' largeVis and tSNE embeddings
 #' @param cd count matrix, rows are genes, columns are cells
 #' @param n.cores number of cores to use
-#' @param batch optional batch factor
+#' @param batch optional batch factor (default=NULL)
+#' @param n.odgenes number of top overdispersed genes to use (dfault=3e3)
+#' @param nPcs number of PCs to use
+#' @param k default number of neighbors to use in kNN graph
+#' @param perplexity perplexity to use in generating tSNE and largeVis embeddings (default=50)
+#' @param log.scale whether to use log scale normalization (default=T)
+#' @param trim number of cells to trim in winsorization (default=10)
+#' @param keep.genes optional set of genes to keep from being filtered out (even at low counts, default=NULL)
+#' @param min.cells.per.gene minimal number of cells required for gene to be kept (unless listed in keep.genes)
 #' @return a new pagoda2 object
 #' @export basicP2proc
-basicP2proc <- function(cd, n.cores = 20, batch = NULL, keep.genes = NULL) {
-  require(Matrix)
-
-  
+basicP2proc <- function(cd, n.cores = 1, batch = NULL,  n.odgenes=3e3, nPcs=100, k=30, perplexity=50, log.scale=TRUE, trim=10, keep.genes = NULL, min.cells.per.gene=30, get.largevis=TRUE, get.tsne=TRUE, make.geneknn=TRUE) {
   rownames(cd) <- make.unique(rownames(cd))
-  
-  p2 <- Pagoda2$new(cd, n.cores = n.cores, batch = batch, keep.genes = keep.genes);
+  ## Basic Processing
+  p2 <- Pagoda2$new(cd, n.cores = n.cores, batch = batch, keep.genes = keep.genes, trim=trim, log.scale=log.scale, min.cells.per.gene=min.cells.per.gene);
   p2$adjustVariance(plot=F, gam.k=10);
-  p2$calculatePcaReduction(nPcs = 300, n.odgenes = 3.e3, maxit = 1000)
-  p2$makeKnnGraph(k = 30, type='PCA', center=TRUE, weight.type = 'none', n.cores = n.cores, distance = 'cosine')
-  p2$getKnnClusters(method = infomap.community, type = 'PCA' ,name = 'infomap')
-  p2$getKnnClusters(method = multilevel.community, type = 'PCA', name = 'multilevel');
-  p2$getKnnClusters(method = walktrap.community, type = 'PCA', name = 'walktrap');
+  p2$calculatePcaReduction(nPcs = nPcs, n.odgenes = n.odgenes, maxit = 1000)
+  ## Make KNN graph and generate clustering
+  p2$makeKnnGraph(k = k, type='PCA', center=TRUE, weight.type = 'none', n.cores = n.cores, distance = 'cosine')
+  p2$getKnnClusters(method = igraph::infomap.community, type = 'PCA' ,name = 'infomap')
+  p2$getKnnClusters(method = igraph::multilevel.community, type = 'PCA', name = 'multilevel');
+  #p2$getKnnClusters(method = igraph::walktrap.community, type = 'PCA', name = 'walktrap');
 
-  M <- 30
-  p2$getEmbedding(type = 'PCA', embeddingType = 'largeVis', M = M, perplexity = 30, gamma = 1/ M, alpha =1)
-  p2$getEmbedding(type = 'PCA', embeddingType = 'tSNE', perplexity = 50);
+  ## Generate embeddings
+  if (get.largevis) {
+      M <- 30
+      p2$getEmbedding(type = 'PCA', embeddingType = 'largeVis', M = M, perplexity = perplexity, gamma = 1/ M, alpha =1)
+  }
+  if (get.tsne) {
+    if(perplexity > nrow(p2$counts)/5) {
+      perplexity <- floor((nrow(p2$counts)-1)/3)
+      cat("perplexity is too large, reducing to",perplexity,"\n");
+    }
 
+      p2$getEmbedding(type = 'PCA', embeddingType = 'tSNE', perplexity = perplexity, distance='L2');
+  }
+  ## Required for web app generation
+  if (make.geneknn) {
+      p2$makeGeneKnnGraph();
+  }
+  ## return
   invisible(p2)
 }
 
@@ -35,7 +55,7 @@ basicP2proc <- function(cd, n.cores = 20, batch = NULL, keep.genes = NULL) {
 #' calculate pathway overdispersion
 #' @param p2 the pagoda 2 object 
 #' @param n.cores number of cores to use
-#' @param organism organisms hs or mm
+#' @param organism organisms hs, mm or dr
 #' @return a list of a p2 object and a go.env
 #' @export extendedP2proc
 extendedP2proc <- function(p2, n.cores = 20, organism = 'hs') {
@@ -139,6 +159,7 @@ webP2proc <- function(p2, additionalMetadata =  NULL, title = 'Pagoda 2', n.core
                        dendrogramCellGroups = p2$clusters$PCA[[1]],
                        additionalMetadata = additionalMetadata,
                        geneSets = genesets,
+                       appname=title,
                        show.clusters = F,
                        appmetadata = appmetadata);
   invisible(p2web);
@@ -170,26 +191,25 @@ p2.generate.go <- function(r, organism = NULL) {
 #' @param r a pagoda2 object
 #' @return a go environment object
 #' @export p2.generate.dr.go
-p2.generate.dr.go <- function(r) {                                                                                                                        
-  # Generate GO environment                                                                                                                               
-  require(org.Dr.eg.db)                                                                                                                                   
-  require(GO.db)                                                                                                                                          
-  require(BiocGenerics)                                                                                                                                   
-  require(AnnotationDbi)                                                                                                                                  
+p2.generate.dr.go <- function(r) {
+  # Generate GO environment
+  if (!requireNamespace("org.Dr.eg.db", quietly = TRUE)) {
+    stop("Package \"org.Dr.eg.db\" needed for this function to work. Please install it.", call. = FALSE)
+  }
   
-  # translate gene names to ids                                                                                                                           
-  ids <- unlist(lapply(BiocGenerics::mget(colnames(r$counts),org.Dr.egALIAS2EG,ifnotfound=NA),function(x) x[1]))                                          
+  # translate gene names to ids
+  ids <- unlist(lapply(BiocGenerics::mget(colnames(r$counts), org.Dr.eg.db::org.Dr.egALIAS2EG,ifnotfound=NA),function(x) x[1]))
   
-  # reverse map                                                                                                                                           
-  rids <- names(ids); names(rids) <- ids;                                                                                                                 
+  # reverse map
+  rids <- names(ids); names(rids) <- ids;
   
-  # list all the ids per GO category                                                                                                                      
-  go.env <- AnnotationDbi::eapply(org.Dr.egGO2ALLEGS,function(x) as.character(na.omit(rids[x])))                                                          
-  go.env <- go.env[unlist(lapply(go.env,length))>5];                                                                                                      
-  go.env <- list2env(go.env);                                                                                                                             
+  # list all the ids per GO category
+  go.env <- AnnotationDbi::eapply(org.Dr.eg.db::org.Dr.egGO2ALLEGS,function(x) as.character(na.omit(rids[x])))
+  go.env <- go.env[unlist(lapply(go.env,length))>5];
+  go.env <- list2env(go.env);
   
-  go.env                                                                                                                                                  
-}                                                                                                                                                             
+  go.env
+}
 
 
 #' Generate a GO environment for human for overdispersion analysis for the the back end
@@ -198,19 +218,18 @@ p2.generate.dr.go <- function(r) {
 #' @export p2.generate.human.go
 p2.generate.human.go <- function(r) {
   # Generate GO environment
-  require(org.Hs.eg.db)
-  require(GO.db)
-  require(BiocGenerics)
-  require(AnnotationDbi)
+  if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    stop("Package \"org.Hs.eg.db\" needed for this function to work. Please install it.", call. = FALSE)
+  }
 
   # translate gene names to ids
-  ids <- unlist(lapply(BiocGenerics::mget(colnames(r$counts),org.Hs.egALIAS2EG,ifnotfound=NA),function(x) x[1]))
+  ids <- unlist(lapply(BiocGenerics::mget(colnames(r$counts),org.Hs.eg.db::org.Hs.egALIAS2EG,ifnotfound=NA),function(x) x[1]))
 
   # reverse map
   rids <- names(ids); names(rids) <- ids;
 
   # list all the ids per GO category
-  go.env <- AnnotationDbi::eapply(org.Hs.egGO2ALLEGS,function(x) as.character(na.omit(rids[x])))
+  go.env <- AnnotationDbi::eapply(org.Hs.eg.db::org.Hs.egGO2ALLEGS,function(x) as.character(na.omit(rids[x])))
   go.env <- go.env[unlist(lapply(go.env,length))>5];
   go.env <- list2env(go.env);
 
@@ -223,19 +242,18 @@ p2.generate.human.go <- function(r) {
 #' @export p2.generate.mouse.go
 p2.generate.mouse.go <- function(r) {
   # Generate GO environment
-  require(org.Mm.eg.db)
-  require(GO.db)
-  require(BiocGenerics)
-  require(AnnotationDbi)
+  if (!requireNamespace("org.Mm.eg.db", quietly = TRUE)) {
+    stop("Package \"org.Mm.eg.db\" needed for this function to work. Please install it.", call. = FALSE)
+  }
 
   # translate gene names to ids
-  ids <- unlist(lapply(BiocGenerics::mget(colnames(r$counts),org.Mm.egALIAS2EG,ifnotfound=NA),function(x) x[1]))
+  ids <- unlist(lapply(BiocGenerics::mget(colnames(r$counts), org.Mm.eg.db::org.Mm.egALIAS2EG,ifnotfound=NA),function(x) x[1]))
 
   # reverse map
   rids <- names(ids); names(rids) <- ids;
 
   # list all the ids per GO category
-  go.env <- AnnotationDbi::eapply(org.Mm.egGO2ALLEGS,function(x) as.character(na.omit(rids[x])))
+  go.env <- AnnotationDbi::eapply(org.Mm.eg.db::org.Mm.egGO2ALLEGS,function(x) as.character(na.omit(rids[x])))
   go.env <- go.env[unlist(lapply(go.env,length))>5];
   go.env <- list2env(go.env);
 
@@ -464,6 +482,45 @@ hierDiffToGenesets <- function(o) {
   })
 }
 
+#' Generate a pagoda2 web object from a pagoda2 object using hierarchical differential expression
+#' @param p2 p2 object
+#' @param title name of the pagoda object
+#' @export p2.toweb.hdea
+p2.toweb.hdea <- function(p2, title="") {
+  hdea <- p2$getHierarchicalDiffExpressionAspects(type='PCA',clusterName='multilevel',z.threshold=3)
+  metadata.forweb <- list();
+  metadata.forweb$multilevel <- p2.metadata.from.factor(p2$clusters$PCA$multilevel, displayname='joint')
+  deSets <- get.de.geneset(p2, groups=p2$clusters$PCA[[1]], prefix='de_')
+  genesets <- c(deSets, hierDiffToGenesets(hdea))
+  appmetadata <- list(apptitle=title)
+  p2$makeGeneKnnGraph();
+  wp <- make.p2.app(p2, additionalMetadata = metadata.forweb, geneSets = genesets,
+                    dendrogramCellGroups = p2$clusters$PCA[[1]], show.clusters=F,
+                    appmetadata = appmetadata)
+  wp
+}
 
 
 
+
+
+
+#' Generate a p2 web application from a pagoda2 object
+#' @param p2 pagoda2 application object
+#' @param app.title name of application as displayed in the browser title
+#' @param extraWebMetadata additional metadata generated by p2.metadata.from.fractor
+#' @param n.cores number of cores to use for differential expression calculation
+#' @return a pagoda2 web object
+#' @export basicP2web
+basicP2web <- function(p2,app.title = 'Pagoda2', extraWebMetadata = NULL, n.cores = 4) {
+    cat('Calculating hdea...\n')
+    hdea <- p2$getHierarchicalDiffExpressionAspects(type='PCA',clusterName='multilevel',z.threshold=3, n.cores = n.cores)
+    metadata.forweb <- list();
+    metadata.forweb$multilevel <- p2.metadata.from.factor(p2$clusters$PCA$multilevel,displayname='Multilevel')
+    metadata.forweb <- c(metadata.forweb, extraWebMetadata)
+    genesets <- hierDiffToGenesets(hdea)
+    appmetadata = list(apptitle=app.title)
+    cat('Making KNN graph...\n')
+    #p2$makeGeneKnnGraph(n.cores=n.cores)
+    make.p2.app(p2, additionalMetadata = metadata.forweb, geneSets = genesets, dendrogramCellGroups = p2$clusters$PCA$multilevel, show.clusters=F, appmetadata = appmetadata)
+}

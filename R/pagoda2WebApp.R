@@ -113,7 +113,6 @@ pagoda2WebApp <- setRefClass(
       hcGroups <- hclust(as.dist(ld), method = 'ward.D');
       
       if(orderDend){
-        require(dendsort)
         hcGroups <- dendsort::dendsort(hcGroups)
       }
       # We now need to derive a cell order compatible with the order
@@ -162,16 +161,14 @@ pagoda2WebApp <- setRefClass(
               }
               
             } else if(innerOrder == "knn") {
-              require(largeVis)
-              
               celsel <- names(cl0)[cl0 == x]
               k <- round(pmax(length(celsel)*0.20,5)) # Coarse estimate for k
               nv <- ceiling(pmax(length(celsel)*0.10,5)) # Coarse estimate for appropriate number of PCs
               
-              xx <- r$counts[celsel,] %*% irlba(r$counts[celsel,],nv = nv,nu=0)$v
+              xx <- r$counts[celsel,] %*% irlba::irlba(r$counts[celsel,],nv = nv,nu=0)$v
               colnames(xx) <- paste('PC',seq(ncol(xx)),sep='')
               
-              xn <- hnswKnnLp(as.matrix(xx),k,nThreads=r$n.cores,p=2.0,verbose=0)
+              xn <- n2Knn(as.matrix(xx),k,nThreads=r$n.cores,verbose=0,indexType='L2')
               
               xn <- xn[!xn$s==xn$e,]
               xn$r <-  unlist(lapply(diff(c(0,which(diff(xn$s)>0),nrow(xn))),function(x) seq(x,1)))
@@ -182,8 +179,8 @@ pagoda2WebApp <- setRefClass(
               xn <- cbind(xn,rd=df$weight)
               edgeMat <- sparseMatrix(i=xn$s+1,j=xn$e+1,x=xn$rd,dims=c(nrow(xx),nrow(xx)))
               edgeMat <- edgeMat + t(edgeMat);
-              wij <- largeVis::buildWijMatrix(edgeMat,perplexity=100,threads=r$n.cores)
-              coords <- largeVis::projectKNNs(wij = wij, dim=1, M = 5, verbose = FALSE,sgd_batches = 2e6,gamma=1, seed=1)
+              wij <- buildWijMatrix(edgeMat,perplexity=100,threads=r$n.cores)
+              coords <- projectKNNs(wij = wij, dim=1, M = 5, verbose = FALSE,sgd_batches = 2e6,gamma=1, seed=1)
               
               rownames(xx)[order(coords)]
               
@@ -802,13 +799,13 @@ pagoda2WebApp <- setRefClass(
       matsparseToSave <- originalP2object$counts[mainDendrogram$cellorder,]
       
       # Main Sparse count matrix TRANSPOSED for de
-      matsparseTransposedToSave <- t(originalP2object$counts)
+      matsparseTransposedToSave <- Matrix::t(originalP2object$counts)
       
       # Serialise aspect matrix
       cellIndices <- mainDendrogram$cellorder;
       aspectMatrixToSave <- originalP2object$misc$pathwayOD$xv[,cellIndices,drop=F];
       
-      aspectMatrixToSave <- t(aspectMatrixToSave);
+      aspectMatrixToSave <- Matrix::t(aspectMatrixToSave);
       aspectMatrixToSave <- Matrix(aspectMatrixToSave, sparse=T);
       
       # Serialise the aspect information
@@ -972,18 +969,12 @@ pagoda2WebApp <- setRefClass(
     
     ## Generate a JSON list representation of the gene KNN network
     generateGeneKnnJSON = function() {
-      require(rjson)
-      
-      cs <- cumsum(table(originalP2object$genegraphs$graph$from)[unique(originalP2object$genegraphs$graph$from)])
-      y <- lapply(1:length(cs),function(n){
-        if(n == 1){
-          originalP2object$genegraphs$graph$to[1:cs[n]]
-        } else {
-          originalP2object$genegraphs$graph$to[(cs[n-1]+1):cs[n]]
-        }
-      })
-      names(y) <- unique(originalP2object$genegraphs$graph$from)
-      toJSON(y)
+        froms <- unique(originalP2object$genegraphs$graph$from)
+        names(froms) <- froms
+        y <- lapply(froms, function(n) {
+            subset(originalP2object$genegraphs$graph, from == n)$to
+        })
+        toJSON(y)
     },
     
     ## Generate information about the embeddings we are exporting
